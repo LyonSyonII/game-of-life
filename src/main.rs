@@ -1,15 +1,19 @@
+use std::sync::atomic;
+
 use minifb::{Key, MouseMode, Window, WindowOptions};
 
-const WIDTH: usize = 32;
-const HEIGHT: usize = 32;
+const N: usize = 32;
+
+// SAFETY: AtomicU32 is repr(transparent) with u32
+static BUFFER: [atomic::AtomicU32; N * N] = unsafe { std::mem::transmute([0u32; N * N]) };
+static SIMULATION_FPS: atomic::AtomicUsize = atomic::AtomicUsize::new(30);
+static PAUSED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
 fn main() {
-    let mut buffer = [0; WIDTH * HEIGHT];
-
     let mut window = Window::new(
         "Conwell's Game of Life - By Liam Garriga",
-        WIDTH,
-        HEIGHT,
+        N,
+        N,
         WindowOptions {
             scale: minifb::Scale::X32,
             ..Default::default()
@@ -17,73 +21,98 @@ fn main() {
     )
     .unwrap();
 
-    let target_fps = 60;
-    // Limit to max ~60 fps update rate
-    window.set_target_fps(target_fps);
+    let window_fps = 60;
+    window.set_target_fps(window_fps);
 
-    let mut tick = 0;
-    let mut simulation_speed = 10;
-    let mut paused = false;
+    std::thread::spawn(simulation_update);
+    window_update(window, window_fps);
+
+    std::process::exit(0);
+}
+
+fn window_update(mut window: minifb::Window, window_fps: usize) {
     while window.is_open() {
-        let timing = std::time::Instant::now();
-
         if window.is_key_pressed(Key::Up, minifb::KeyRepeat::Yes) {
-            simulation_speed = std::cmp::max(1, simulation_speed - 1);
+            SIMULATION_FPS
+                .fetch_update(atomic::Ordering::Release, atomic::Ordering::Acquire, |s| {
+                    Some(std::cmp::min(window_fps, s + 1))
+                })
+                .unwrap();
         } else if window.is_key_pressed(Key::Down, minifb::KeyRepeat::Yes) {
-            simulation_speed += 1;
+            SIMULATION_FPS
+                .fetch_update(atomic::Ordering::Release, atomic::Ordering::Acquire, |s| {
+                    Some(std::cmp::max(1, s - 1))
+                })
+                .unwrap();
         } else if window.is_key_pressed(Key::Space, minifb::KeyRepeat::No) {
-            paused = !paused;
+            PAUSED
+                .fetch_update(atomic::Ordering::Release, atomic::Ordering::Acquire, |b| {
+                    Some(!b)
+                })
+                .unwrap();
         } else if window.is_key_pressed(Key::C, minifb::KeyRepeat::No) {
-            buffer.fill(0);
+            BUFFER
+                .iter()
+                .for_each(|i| i.store(u32::MAX, atomic::Ordering::Release));
         } else if window.get_mouse_down(minifb::MouseButton::Left) {
             if let Some((y, x)) = window.get_mouse_pos(MouseMode::Discard) {
-                buffer[x as usize * WIDTH + y as usize] = u32::MAX;
+                BUFFER[x as usize * N + y as usize].store(u32::MAX, atomic::Ordering::Release);
             }
         }
 
-        if !paused && tick % simulation_speed == 0 {
-            simulate(&mut buffer);
-        }
-        
-        tick += 1;
-        
-        // We unwrap here as we want this code to exit if it fails. Real applications may want to handle this in a different way
-        window.update_with_buffer(&buffer, WIDTH, HEIGHT).unwrap();
+        // SAFETY: AtomicU32 is repr(transparent) with u32; 
+        //         We only read the buffer, and don't care if it's partially incorrect
+        window
+            .update_with_buffer(
+                unsafe { std::mem::transmute::<&[atomic::AtomicU32], &[u32]>(BUFFER.as_slice()) },
+                N,
+                N,
+            )
+            .unwrap();
+    }
+}
 
-        if !paused && tick % simulation_speed == 0 {
-            eprintln!(
-                "framerate: {}",
-                (1f32 / (timing.elapsed().as_secs_f32()) / simulation_speed as f32)
-            );
+fn simulation_update() {
+    let mut frametiming = std::time::Instant::now();
+    let mut prev_time = std::time::Instant::now();
+    loop {
+        let simulation_fps = SIMULATION_FPS.load(atomic::Ordering::Acquire);
+
+        let delta = prev_time.elapsed();
+        let rate = std::time::Duration::from_secs_f32(1. / simulation_fps as f32);
+        if delta < rate {
+            let sleep_time = rate - delta;
+            std::thread::sleep(sleep_time);
+        }
+
+        prev_time = std::time::Instant::now();
+
+        if !PAUSED.load(atomic::Ordering::Relaxed) {
+            simulate(&BUFFER);
+            let elapsed = frametiming.elapsed();
+            eprintln!("{:.2}fps | {elapsed:.2?}", (1f32 / elapsed.as_secs_f32()));
+            frametiming = std::time::Instant::now();
         }
     }
 }
 
-fn simulate(cells: &mut [u32; WIDTH * HEIGHT]) {
-    const N: usize = WIDTH;
+fn simulate(cells: &[atomic::AtomicU32; N * N]) {
+    // SAFETY: AtomicU32 is repr(transparent) with u32;
+    let clone = unsafe { std::mem::transmute_copy::<_, [u32; N * N]>(cells) }; // copy
+    let get = |i| clone.get(i).copied().unwrap_or_default() >> 31;
 
-    let clone = unsafe { std::mem::transmute_copy::<_, [[u32; WIDTH]; HEIGHT]>(cells) };
-    let get = |i, j| {
-        clone
-            .get(i)
-            .and_then(|row: &[u32; 32]| row.get(j).copied())
-            .unwrap_or_default()
-            >> 31
-    };
-    for i in 0..N {
-        for j in 0..N {
-            let neighbors: u32 = get(i, j + 1)
-                + get(i, j - 1)
-                + get(i + 1, j)
-                + get(i - 1, j)
-                + get(i + 1, j + 1)
-                + get(i + 1, j - 1)
-                + get(i - 1, j + 1)
-                + get(i - 1, j - 1);
-
-            let cell = &mut cells[i * N + j];
-            *cell *= (neighbors == 2) as u32;
-            *cell |= (neighbors == 3) as u32 * u32::MAX;
-        }
+    for (i, cell) in cells.iter().enumerate() {
+        let neighbors: u32 = get(i + 1)
+            + get(i - 1)
+            + get(i + N)
+            + get(i - N)
+            + get(i - N - 1)
+            + get(i - N + 1)
+            + get(i + N + 1)
+            + get(i + N - 1);
+        let mut c = cell.load(atomic::Ordering::Acquire);
+        c *= (neighbors == 2) as u32;
+        c |= (neighbors == 3) as u32 * u32::MAX;
+        cell.store(c, atomic::Ordering::Release);
     }
 }

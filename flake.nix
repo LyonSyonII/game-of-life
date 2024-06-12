@@ -30,16 +30,23 @@
           fenix.complete.rust-src
           fenix.complete.rustc-codegen-cranelift-preview
           fenix.complete.llvm-tools-preview
+          fenix.targets.x86_64-pc-windows-gnu.latest.rust-std
+          fenix.targets.x86_64-unknown-linux-gnu.latest.rust-std
+          
+          openssl.dev
+          pkg-config
           
           xorg.libX11
           xorg.libXcursor
           # libxkbcommon
           # wayland
           # wayland-protocols
+          cargo-machete
+          cargo-unused-features
         ];
         RUST_SRC_PATH = "${pkgs.fenix.complete.rust-src}/lib/rustlib/src/rust/library";
         RUSTC_WRAPPER="sccache";
-        RUSTFLAGS="-Zcodegen-backend=llvm -Zthreads=12 -Ctarget-cpu=native -Clink-arg=-fuse-ld=mold";
+        RUSTFLAGS="-Zthreads=12 -Ctarget-cpu=native -Clink-arg=-fuse-ld=mold";
         MSRVFLAGS="-Clink-arg=-fuse-ld=mold"; # RUSTFLAGS=$MSRVFLAGS cargo msrv
 
         LD_LIBRARY_PATH = with pkgs; lib.makeLibraryPath nativeBuildInputs;
